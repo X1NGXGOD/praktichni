@@ -1,11 +1,16 @@
-from flask import Flask, request
+from flask import Flask, request, jsonify
 from flask_restful import Api, Resource
 from flask_sqlalchemy import SQLAlchemy
 from marshmallow import Schema, fields, ValidationError
+from flask_jwt_extended import (
+    JWTManager, create_access_token, jwt_required
+)
+from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
 app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///db.sqlite3"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["JWT_SECRET_KEY"] = "super-secret-key"
 
 db = SQLAlchemy(app)
 api = Api(app)
@@ -15,6 +20,12 @@ product_tags = db.Table(
     db.Column("product_id", db.Integer, db.ForeignKey("products.id"), primary_key=True),
     db.Column("tag_id",     db.Integer, db.ForeignKey("tags.id"),     primary_key=True),
 )
+
+class User(db.Model):
+    __tablename__ = "users"
+    id       = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    password = db.Column(db.String(128), nullable=False)
 
 class Product(db.Model):
     __tablename__ = "products"
@@ -38,14 +49,18 @@ class Shop(db.Model):
 
 class Tag(db.Model):
     __tablename__ = "tags"
-    id   = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(50), unique=True, nullable=False)
+    id       = db.Column(db.Integer, primary_key=True)
+    name     = db.Column(db.String(50), unique=True, nullable=False)
     products = db.relationship(
         "Product",
         secondary=product_tags,
         back_populates="tags",
         lazy="dynamic"
     )
+
+class UserSchema(Schema):
+    username = fields.Str(required=True)
+    password = fields.Str(required=True, load_only=True)
 
 class ShopSummarySchema(Schema):
     id    = fields.Int(dump_only=True)
@@ -67,6 +82,7 @@ class ProductSchema(Schema):
 class ShopSchema(ShopSummarySchema):
     products = fields.List(fields.Nested(ProductSchema), dump_only=True)
 
+user_schema     = UserSchema()
 product_schema  = ProductSchema()
 products_schema = ProductSchema(many=True)
 shop_schema     = ShopSchema()
@@ -74,7 +90,50 @@ shops_schema    = ShopSchema(many=True)
 tag_schema      = TagSchema()
 tags_schema     = TagSchema(many=True)
 
-class ProductResource(Resource):
+jwt = JWTManager(app)
+
+@jwt.unauthorized_loader
+def missing_token(error):
+    return jsonify({"error": "Authorization header missing"}), 401
+
+class RegisterResource(Resource):
+    def post(self):
+        json_data = request.get_json() or {}
+        try:
+            data = user_schema.load(json_data)
+        except ValidationError as err:
+            return err.messages, 400
+
+        if User.query.filter_by(username=data["username"]).first():
+            return {"message": "Username already exists"}, 409
+
+        new_user = User(
+            username=data["username"],
+            password=generate_password_hash(data["password"])
+        )
+        db.session.add(new_user)
+        db.session.commit()
+        return {"message": "User registered"}, 201
+
+class LoginResource(Resource):
+    def post(self):
+        json_data = request.get_json() or {}
+        try:
+            data = user_schema.load(json_data)
+        except ValidationError as err:
+            return err.messages, 400
+
+        user = User.query.filter_by(username=data["username"]).first()
+        if not user or not check_password_hash(user.password, data["password"]):
+            return {"message": "Invalid credentials"}, 401
+
+        access_token = create_access_token(identity=user.id)
+        return {"access_token": access_token}, 200
+
+class ProtectedResource(Resource):
+    method_decorators = [jwt_required()]
+
+class ProductResource(ProtectedResource):
     def get(self, title):
         prod = Product.query.filter_by(title=title).first()
         if not prod:
@@ -88,13 +147,12 @@ class ProductResource(Resource):
             db.session.commit()
         return {"message": "Product deleted"}, 200
 
-class ProductListResource(Resource):
+class ProductListResource(ProtectedResource):
     def get(self):
-        all_prods = Product.query.all()
-        return products_schema.dump(all_prods), 200
+        return products_schema.dump(Product.query.all()), 200
 
     def post(self):
-        json_data = request.get_json()
+        json_data = request.get_json() or {}
         try:
             data = product_schema.load(json_data)
         except ValidationError as err:
@@ -114,7 +172,7 @@ class ProductListResource(Resource):
         db.session.commit()
         return product_schema.dump(new_prod), 201
 
-class ShopResource(Resource):
+class ShopResource(ProtectedResource):
     def get(self, title):
         shop = Shop.query.filter_by(title=title).first()
         if not shop:
@@ -128,12 +186,12 @@ class ShopResource(Resource):
             db.session.commit()
         return {"message": "Shop deleted"}, 200
 
-class ShopListResource(Resource):
+class ShopListResource(ProtectedResource):
     def get(self):
         return shops_schema.dump(Shop.query.all()), 200
 
     def post(self):
-        json_data = request.get_json()
+        json_data = request.get_json() or {}
         try:
             data = shop_schema.load(json_data)
         except ValidationError as err:
@@ -147,7 +205,7 @@ class ShopListResource(Resource):
         db.session.commit()
         return shop_schema.dump(new_shop), 201
 
-class TagResource(Resource):
+class TagResource(ProtectedResource):
     def get(self, name):
         tag = Tag.query.filter_by(name=name).first()
         if not tag:
@@ -161,12 +219,12 @@ class TagResource(Resource):
             db.session.commit()
         return {"message": "Tag deleted"}, 200
 
-class TagListResource(Resource):
+class TagListResource(ProtectedResource):
     def get(self):
         return tags_schema.dump(Tag.query.all()), 200
 
     def post(self):
-        json_data = request.get_json()
+        json_data = request.get_json() or {}
         try:
             data = tag_schema.load(json_data)
         except ValidationError as err:
@@ -180,7 +238,7 @@ class TagListResource(Resource):
         db.session.commit()
         return tag_schema.dump(new_tag), 201
 
-class ProductTagLinkResource(Resource):
+class ProductTagLinkResource(ProtectedResource):
     def post(self, title, tag_id):
         prod = Product.query.filter_by(title=title).first_or_404()
         tag  = Tag.query.get_or_404(tag_id)
@@ -197,15 +255,18 @@ class ProductTagLinkResource(Resource):
             db.session.commit()
         return {"message": "Tag unlinked from product"}, 200
 
-api.add_resource(ProductResource,           "/product/<string:title>")
-api.add_resource(ProductListResource,       "/products")
-api.add_resource(ShopResource,              "/shop/<string:title>")
-api.add_resource(ShopListResource,          "/shops")
-api.add_resource(TagResource,               "/tag/<string:name>")
-api.add_resource(TagListResource,           "/tags")
-api.add_resource(ProductTagLinkResource,    "/product/<string:title>/tags/<int:tag_id>")
+api.add_resource(RegisterResource,      "/register")
+api.add_resource(LoginResource,         "/login")
+api.add_resource(ProductResource,       "/product/<string:title>")
+api.add_resource(ProductListResource,   "/products")
+api.add_resource(ShopResource,          "/shop/<string:title>")
+api.add_resource(ShopListResource,      "/shops")
+api.add_resource(TagResource,           "/tag/<string:name>")
+api.add_resource(TagListResource,       "/tags")
+api.add_resource(ProductTagLinkResource,"/product/<string:title>/tags/<int:tag_id>")
 
 if __name__ == "__main__":
     with app.app_context():
         db.create_all()
     app.run(debug=True)
+    
